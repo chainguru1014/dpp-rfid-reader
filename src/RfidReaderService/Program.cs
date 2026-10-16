@@ -9,6 +9,7 @@ builder.Services.AddControllers();
 builder.Services.AddOpenApi();
 
 builder.Services.Configure<ReaderOptions>(builder.Configuration.GetSection(ReaderOptions.SectionName));
+builder.Services.AddSingleton<ReaderConnectionSettingsStore>();
 builder.Services.AddSingleton<ImpinjReaderManager>();
 builder.Services.AddHostedService<ReaderAutoConnectHostedService>();
 
@@ -27,6 +28,7 @@ app.UseExceptionHandler(handler =>
         var (statusCode, message) = exception switch
         {
             OctaneSdkException ex => (StatusCodes.Status502BadGateway, ex.Message),
+            ArgumentException ex => (StatusCodes.Status400BadRequest, ex.Message),
             InvalidOperationException ex => (StatusCodes.Status409Conflict, ex.Message),
             _ => (StatusCodes.Status500InternalServerError, "An unexpected error occurred."),
         };

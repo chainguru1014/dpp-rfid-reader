@@ -12,7 +12,11 @@ public class ReaderOptions
 
     public int MessageTimeoutMs { get; set; } = 5000;
 
-    public int[] AntennaPorts { get; set; } = [1];
+    // No default-value initializer here: the config binder appends bound array elements
+    // onto an existing array value rather than replacing it, so a literal default like
+    // "= [1]" combined with an appsettings.json value produces [1, 1]. Default applied
+    // at the one place this is read (ReaderConnectionSettingsStore.SeedFromLegacyOptions).
+    public int[]? AntennaPorts { get; set; }
 
     public bool MaxTxPower { get; set; } = true;
 
@@ -31,4 +35,11 @@ public class ReaderOptions
     public int MaxRecentTags { get; set; } = 500;
 
     public int TagSnapshotExpirySeconds { get; set; } = 10;
+
+    /// <summary>
+    /// Path (relative to the content root, unless rooted) where the mutable connection
+    /// settings managed via GET/PUT /api/reader/settings are persisted. The properties
+    /// above are only used to seed this file the first time it doesn't exist yet.
+    /// </summary>
+    public string ConnectionSettingsFilePath { get; set; } = "reader-connection-settings.json";
 }

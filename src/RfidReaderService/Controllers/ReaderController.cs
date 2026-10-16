@@ -6,7 +6,7 @@ namespace RfidReaderService.Controllers;
 
 [ApiController]
 [Route("api/reader")]
-public class ReaderController(ImpinjReaderManager manager) : ControllerBase
+public class ReaderController(ImpinjReaderManager manager, ReaderConnectionSettingsStore settingsStore) : ControllerBase
 {
     [HttpGet("status")]
     public ActionResult<ReaderStatusDto> GetStatus() => Ok(manager.GetStatus());
@@ -38,4 +38,11 @@ public class ReaderController(ImpinjReaderManager manager) : ControllerBase
         manager.StopReading();
         return Ok(manager.GetStatus());
     }
+
+    [HttpGet("settings")]
+    public ActionResult<ReaderConnectionSettingsDto> GetSettings() => Ok(settingsStore.Get());
+
+    [HttpPut("settings")]
+    public ActionResult<ReaderConnectionSettingsDto> UpdateSettings([FromBody] ReaderConnectionSettingsDto request) =>
+        Ok(settingsStore.Update(request));
 }

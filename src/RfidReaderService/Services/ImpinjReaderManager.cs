@@ -16,6 +16,7 @@ public class ImpinjReaderManager : IDisposable
 {
     private readonly ILogger<ImpinjReaderManager> _logger;
     private readonly ReaderOptions _options;
+    private readonly ReaderConnectionSettingsStore _settingsStore;
     private readonly object _sdkLock = new();
 
     private readonly ConcurrentQueue<TagReadDto> _recentTags = new();
@@ -26,19 +27,29 @@ public class ImpinjReaderManager : IDisposable
     private string? _lastError;
     private DateTime? _lastErrorAtUtc;
 
-    public ImpinjReaderManager(ILogger<ImpinjReaderManager> logger, IOptions<ReaderOptions> options)
+    // Bumped on every manual Connect()/Disconnect() so a background reconnect loop started
+    // after a dropped connection can notice a manual action happened and abandon itself
+    // instead of fighting it.
+    private int _connectionGeneration;
+
+    public ImpinjReaderManager(
+        ILogger<ImpinjReaderManager> logger,
+        IOptions<ReaderOptions> options,
+        ReaderConnectionSettingsStore settingsStore)
     {
         _logger = logger;
         _options = options.Value;
+        _settingsStore = settingsStore;
     }
 
     public void Connect(string? hostnameOverride = null)
     {
-        var hostname = hostnameOverride ?? _options.Hostname;
+        var connectionSettings = _settingsStore.Get();
+        var hostname = hostnameOverride ?? connectionSettings.IpAddress;
         if (string.IsNullOrWhiteSpace(hostname))
         {
             throw new InvalidOperationException(
-                "No reader hostname configured. Set Reader:Hostname in appsettings.json or pass one in the request.");
+                "No reader IP address configured. Set it via PUT /api/reader/settings or pass one in the request.");
         }
 
         lock (_sdkLock)
@@ -48,15 +59,19 @@ public class ImpinjReaderManager : IDisposable
                 throw new InvalidOperationException("Reader is already connected. Disconnect first.");
             }
 
+            _connectionGeneration++;
+
             _reader ??= CreateReader();
-            _reader.ConnectTimeout = _options.ConnectTimeoutMs;
+            _reader.ConnectTimeout = connectionSettings.ConnectionTimeoutMs;
             _reader.MessageTimeout = _options.MessageTimeoutMs;
 
-            _logger.LogInformation("Connecting to reader at {Hostname}", hostname);
-            _reader.Connect(hostname);
+            _logger.LogInformation("Connecting to reader at {Hostname}:{Port}", hostname, connectionSettings.Port);
+            _reader.Connect(hostname, connectionSettings.Port);
 
-            ApplyConfiguredSettings(_reader);
-            _logger.LogInformation("Connected to reader at {Hostname}", hostname);
+            ApplyConfiguredSettings(_reader, connectionSettings);
+            TryUpdateAvailableAntennaPorts(_reader);
+
+            _logger.LogInformation("Connected to reader at {Hostname}:{Port}", hostname, connectionSettings.Port);
         }
     }
 
@@ -64,6 +79,8 @@ public class ImpinjReaderManager : IDisposable
     {
         lock (_sdkLock)
         {
+            _connectionGeneration++;
+
             if (_reader is null)
             {
                 return;
@@ -173,7 +190,7 @@ public class ImpinjReaderManager : IDisposable
         return reader;
     }
 
-    private void ApplyConfiguredSettings(ImpinjReader reader)
+    private void ApplyConfiguredSettings(ImpinjReader reader, ReaderConnectionSettingsDto connectionSettings)
     {
         var settings = reader.QueryDefaultSettings();
 
@@ -184,19 +201,38 @@ public class ImpinjReaderManager : IDisposable
         settings.Report.IncludeLastSeenTime = true;
         settings.Report.IncludePhaseAngle = true;
 
-        settings.RfMode = (uint)_options.RfMode;
-        settings.SearchMode = Enum.Parse<SearchMode>(_options.SearchMode, ignoreCase: true);
-        settings.Session = _options.Session;
+        var inventory = connectionSettings.InventorySettings;
+
+        if (inventory.RfMode is { } rfMode)
+        {
+            settings.RfMode = rfMode;
+        }
+
+        if (inventory.SearchMode is { } searchModeName &&
+            Enum.TryParse<SearchMode>(searchModeName, ignoreCase: true, out var searchMode))
+        {
+            settings.SearchMode = searchMode;
+        }
+
+        if (inventory.Session is { } session)
+        {
+            settings.Session = session;
+        }
 
         settings.Antennas.DisableAll();
-        foreach (var port in _options.AntennaPorts)
+        foreach (var port in connectionSettings.EnabledAntennaPorts)
         {
             var antenna = settings.Antennas.GetAntenna((ushort)port);
             antenna.IsEnabled = true;
-            antenna.MaxTxPower = _options.MaxTxPower;
-            if (!_options.MaxTxPower && _options.TxPowerInDbm is { } txPower)
+
+            if (inventory.PowerDbm is { } powerDbm)
             {
-                antenna.TxPowerInDbm = txPower;
+                antenna.MaxTxPower = false;
+                antenna.TxPowerInDbm = powerDbm;
+            }
+            else
+            {
+                antenna.MaxTxPower = true;
             }
 
             antenna.MaxRxSensitivity = _options.MaxRxSensitivity;
@@ -207,6 +243,20 @@ public class ImpinjReaderManager : IDisposable
         }
 
         reader.ApplySettings(settings);
+    }
+
+    private void TryUpdateAvailableAntennaPorts(ImpinjReader reader)
+    {
+        try
+        {
+            var featureSet = reader.QueryFeatureSet();
+            var ports = Enumerable.Range(1, (int)featureSet.AntennaCount).ToArray();
+            _settingsStore.UpdateAvailableAntennaPorts(ports);
+        }
+        catch (OctaneSdkException ex)
+        {
+            _logger.LogWarning(ex, "Failed to query reader feature set for available antenna ports");
+        }
     }
 
     private void TryStopInternal()
@@ -254,9 +304,63 @@ public class ImpinjReaderManager : IDisposable
     private void OnConnectionLost(ImpinjReader reader)
     {
         _logger.LogWarning("Connection lost to reader at {Address}", reader.Address);
+        var resumeReading = _isStarted;
         _isStarted = false;
         _lastError = "Connection lost";
         _lastErrorAtUtc = DateTime.UtcNow;
+
+        var connectionSettings = _settingsStore.Get();
+        if (connectionSettings.AutoReconnect)
+        {
+            var generation = _connectionGeneration;
+            _ = Task.Run(() => ReconnectLoopAsync(generation, resumeReading));
+        }
+    }
+
+    private async Task ReconnectLoopAsync(int generation, bool resumeReading)
+    {
+        var attempt = 0;
+
+        while (true)
+        {
+            var connectionSettings = _settingsStore.Get();
+            if (!connectionSettings.UnlimitedReconnectAttempts && attempt >= connectionSettings.MaxReconnectAttempts)
+            {
+                _logger.LogError("Giving up reconnecting to reader after {Attempts} attempt(s)", attempt);
+                return;
+            }
+
+            if (generation != _connectionGeneration)
+            {
+                _logger.LogInformation("Abandoning reconnect loop; reader state changed manually");
+                return;
+            }
+
+            attempt++;
+            await Task.Delay(connectionSettings.ReconnectIntervalMs);
+
+            if (generation != _connectionGeneration)
+            {
+                return;
+            }
+
+            try
+            {
+                _logger.LogInformation("Reconnect attempt {Attempt} to reader", attempt);
+                Connect();
+                if (resumeReading)
+                {
+                    StartReading();
+                }
+
+                _logger.LogInformation("Reconnected to reader after {Attempt} attempt(s)", attempt);
+                return;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Reconnect attempt {Attempt} failed", attempt);
+            }
+        }
     }
 
     private void OnErrorNotification(ImpinjReader reader, Exception error)

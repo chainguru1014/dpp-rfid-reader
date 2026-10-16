@@ -484,3 +484,6 @@ $RECYCLE.BIN/
 # Keep the vendored Octane SDK package (required for restore via local-packages feed)
 !/octanesdk.*.nupkg
 !/local-packages/*.nupkg
+
+# Runtime-generated, per-environment reader connection settings (GET/PUT /api/reader/settings)
+reader-connection-settings.json

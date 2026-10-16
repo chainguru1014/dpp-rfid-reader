@@ -1,20 +1,18 @@
-using Microsoft.Extensions.Options;
-using RfidReaderService.Configuration;
-
 namespace RfidReaderService.Services;
 
 /// <summary>
-/// On startup, connects to and starts the reader if Reader:AutoConnect is enabled in configuration.
+/// On startup, connects to and starts the reader if the persisted connection settings
+/// (GET/PUT /api/reader/settings) have AutoConnectOnStartup enabled.
 /// On shutdown, always attempts a clean disconnect.
 /// </summary>
 public class ReaderAutoConnectHostedService(
     ImpinjReaderManager manager,
-    IOptions<ReaderOptions> options,
+    ReaderConnectionSettingsStore settingsStore,
     ILogger<ReaderAutoConnectHostedService> logger) : IHostedService
 {
     public Task StartAsync(CancellationToken cancellationToken)
     {
-        if (!options.Value.AutoConnect)
+        if (!settingsStore.Get().AutoConnectOnStartup)
         {
             return Task.CompletedTask;
         }
